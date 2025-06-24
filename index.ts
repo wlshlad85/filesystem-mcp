@@ -193,57 +193,81 @@ async function getFileStats(filePath: string): Promise<FileInfo> {
   };
 }
 
-async function searchFiles(
-  rootPath: string,
-  pattern: string,
-  excludePatterns: string[] = []
-): Promise<string[]> {
-  const results: string[] = [];
+// ============================================================================
+// CONFIGURATION CONSTANTS - Grouped for easy modification
+// ============================================================================
 
-  async function search(currentPath: string) {
-    const entries = await fs.readdir(currentPath, { withFileTypes: true });
+// File reading limits
+const FILE_SIZE_LIMIT = 1024 * 1024; // 1MB default
+const FILE_SIZE_WARNING_THRESHOLD = 512 * 1024; // 512KB - warn before hitting limit
+const DEFAULT_MAX_LINES = 1000; // Max lines when not using head/tail
+const MAX_FILES_TO_READ = 10; // Maximum files for read_multiple_files
+const MAX_TOTAL_SIZE_MULTIPLE_FILES = 5 * 1024 * 1024; // 5MB total for multiple files
 
-    for (const entry of entries) {
-      const fullPath = path.join(currentPath, entry.name);
+// Directory listing limits
+const MAX_DIR_ENTRIES = 500; // Maximum entries to return per directory
+const MAX_DIR_ENTRIES_WARNING = 100; // Warn when directory has more than this
 
-      try {
-        // Validate each path before processing
-        await validatePath(fullPath);
+// Tree traversal limits
+const MAX_TREE_DEPTH = 5; // Maximum depth for directory tree
+const MAX_TREE_ENTRIES = 1000; // Maximum total entries in tree
+const TREE_SKIP_PATTERNS = [
+  'node_modules',
+  '.git',
+  '.svn',
+  '.hg',
+  '.DS_Store',
+  'dist',
+  'build',
+  'out',
+  'target',
+  'bin',
+  'obj',
+  '.next',
+  '.nuxt',
+  '.cache',
+  'coverage',
+  '.nyc_output',
+  '.pytest_cache',
+  '__pycache__',
+  '.venv',
+  'venv',
+  '.env',
+  'env',
+  'vendor',
+  'bower_components',
+  'jspm_packages',
+  '.npm',
+  '.yarn',
+  'tmp',
+  'temp',
+  '.tmp',
+  '.temp',
+  'logs',
+  '*.log'
+];
 
-        // Check if path matches any exclude pattern
-        const relativePath = path.relative(rootPath, fullPath);
-        const shouldExclude = excludePatterns.some(pattern => {
-          const globPattern = pattern.includes('*') ? pattern : `**/${pattern}/**`;
-          return minimatch(relativePath, globPattern, { dot: true });
-        });
+// Search limits
+const MAX_SEARCH_RESULTS = 100; // Maximum search results to return
+const MAX_SEARCH_DEPTH = 10; // Maximum depth for file search
+const SEARCH_SKIP_PATTERNS = TREE_SKIP_PATTERNS; // Reuse same patterns for search
 
-        if (shouldExclude) {
-          continue;
-        }
+// Output formatting
+const TRUNCATION_MESSAGE = (shown: number, total: number) => 
+  `\n... truncated ${total - shown} additional entries ...`;
+const SIZE_WARNING_MESSAGE = (size: number, limit: number) => 
+  `\nWarning: File size (${formatSize(size)}) exceeds limit (${formatSize(limit)})`;
 
-        if (entry.name.toLowerCase().includes(pattern.toLowerCase())) {
-          results.push(fullPath);
-        }
+// ============================================================================
+// END CONFIGURATION
+// ============================================================================
 
-        if (entry.isDirectory()) {
-          await search(fullPath);
-        }
-      } catch (error) {
-        // Skip invalid paths during search
-        continue;
-      }
-    }
-  }
-
-  await search(rootPath);
-  return results;
-}
-
-// file editing and diffing utilities
+// Normalize line endings for consistent processing
 function normalizeLineEndings(text: string): string {
   return text.replace(/\r\n/g, '\n');
 }
 
+// Create a unified diff string for two file contents
 function createUnifiedDiff(originalContent: string, newContent: string, filepath: string = 'file'): string {
   // Ensure consistent line endings for diff
   const normalizedOriginal = normalizeLineEndings(originalContent);
@@ -259,6 +283,7 @@ function createUnifiedDiff(originalContent: string, newContent: string, filepath
   );
 }
 
+// Apply a series of text edits to a file, with optional dry run
 async function applyFileEdits(
   filePath: string,
   edits: Array<{oldText: string, newText: string}>,
@@ -438,6 +463,171 @@ async function headFile(filePath: string, numLines: number): Promise<string> {
   }
 }
 
+// Add helper to check if path should be skipped
+function shouldSkipPath(pathName: string, skipPatterns: string[]): boolean {
+  const baseName = path.basename(pathName);
+  return skipPatterns.some(pattern => {
+    if (pattern.includes('*')) {
+      return minimatch(baseName, pattern);
+    }
+    return baseName === pattern;
+  });
+}
+
+// Add helper to count lines efficiently without loading entire file
+async function countFileLines(filePath: string): Promise<number> {
+  const fileHandle = await fs.open(filePath, 'r');
+  try {
+    let lineCount = 0;
+    let buffer = Buffer.alloc(65536); // 64KB buffer
+    let leftover = '';
+    let position = 0;
+    
+    while (true) {
+      const { bytesRead } = await fileHandle.read(buffer, 0, buffer.length, position);
+      if (bytesRead === 0) break;
+      
+      const chunk = leftover + buffer.slice(0, bytesRead).toString('utf-8');
+      const lines = chunk.split('\n');
+      
+      // Keep the last incomplete line for next iteration
+      leftover = lines.pop() || '';
+      lineCount += lines.length;
+      position += bytesRead;
+    }
+    
+    if (leftover) lineCount++; // Count the last line
+    return lineCount;
+  } finally {
+    await fileHandle.close();
+  }
+}
+
+// Update searchFiles to respect limits
+async function searchFiles(
+  rootPath: string,
+  pattern: string,
+  excludePatterns: string[] = []
+): Promise<string[]> {
+  const results: string[] = [];
+  let totalChecked = 0;
+
+  async function search(currentPath: string, depth: number = 0) {
+    // Check depth limit
+    if (depth > MAX_SEARCH_DEPTH) return;
+    
+    // Check results limit
+    if (results.length >= MAX_SEARCH_RESULTS) return;
+
+    const entries = await fs.readdir(currentPath, { withFileTypes: true });
+
+    for (const entry of entries) {
+      const fullPath = path.join(currentPath, entry.name);
+
+      try {
+        // Validate each path before processing
+        await validatePath(fullPath);
+
+        // Check if we should skip this path
+        if (shouldSkipPath(entry.name, SEARCH_SKIP_PATTERNS)) continue;
+
+        // Check if path matches any exclude pattern
+        const relativePath = path.relative(rootPath, fullPath);
+        const shouldExclude = excludePatterns.some(pattern => {
+          return minimatch(relativePath, pattern);
+        });
+
+        if (shouldExclude) continue;
+
+        totalChecked++;
+
+        if (entry.name.toLowerCase().includes(pattern.toLowerCase())) {
+          results.push(fullPath);
+          if (results.length >= MAX_SEARCH_RESULTS) {
+            results.push(TRUNCATION_MESSAGE(results.length - 1, totalChecked));
+            return;
+          }
+        }
+
+        if (entry.isDirectory()) {
+          await search(fullPath, depth + 1);
+        }
+      } catch (error) {
+        // Skip invalid paths during search
+        continue;
+      }
+    }
+  }
+
+  await search(rootPath);
+  return results;
+}
+
+// Add new helper for directory tree with limits
+async function getDirectoryTree(
+  dirPath: string, 
+  depth: number = 0,
+  entriesCount: { count: number }
+): Promise<any> {
+  if (depth > MAX_TREE_DEPTH) {
+    return {
+      name: path.basename(dirPath),
+      type: 'directory',
+      children: [{ name: '... max depth reached ...', type: 'truncation' }]
+    };
+  }
+
+  if (entriesCount.count >= MAX_TREE_ENTRIES) {
+    return {
+      name: path.basename(dirPath),
+      type: 'directory',
+      children: [{ name: '... max entries reached ...', type: 'truncation' }]
+    };
+  }
+
+  const entries = await fs.readdir(dirPath, { withFileTypes: true });
+  const tree: any = {
+    name: path.basename(dirPath),
+    type: 'directory',
+    children: []
+  };
+
+  for (const entry of entries) {
+    if (entriesCount.count >= MAX_TREE_ENTRIES) {
+      tree.children.push({ name: '... max entries reached ...', type: 'truncation' });
+      break;
+    }
+
+    // Skip patterns
+    if (shouldSkipPath(entry.name, TREE_SKIP_PATTERNS)) continue;
+
+    entriesCount.count++;
+
+    if (entry.isDirectory()) {
+      const subPath = path.join(dirPath, entry.name);
+      try {
+        await validatePath(subPath);
+        const subTree = await getDirectoryTree(subPath, depth + 1, entriesCount);
+        tree.children.push(subTree);
+      } catch (error) {
+        // Skip inaccessible directories
+        tree.children.push({
+          name: entry.name,
+          type: 'directory',
+          error: 'access denied'
+        });
+      }
+    } else {
+      tree.children.push({
+        name: entry.name,
+        type: 'file'
+      });
+    }
+  }
+
+  return tree;
+}
+
 // Tool handlers
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
@@ -571,24 +761,45 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
         const validPath = await validatePath(parsed.data.path);
         
+        // Check file size before reading
+        const stats = await fs.stat(validPath);
+        if (stats.size > FILE_SIZE_LIMIT && !parsed.data.head && !parsed.data.tail) {
+          throw new Error(
+            `File size (${formatSize(stats.size)}) exceeds limit (${formatSize(FILE_SIZE_LIMIT)}). ` +
+            `Use 'head' or 'tail' parameters to read partial content.`
+          );
+        }
+        
         if (parsed.data.head && parsed.data.tail) {
-          throw new Error("Cannot specify both head and tail parameters simultaneously");
+          throw new Error("Cannot specify both head and tail");
         }
         
         if (parsed.data.tail) {
-          // Use memory-efficient tail implementation for large files
-          const tailContent = await tailFile(validPath, parsed.data.tail);
+          const content = await tailFile(validPath, parsed.data.tail);
           return {
-            content: [{ type: "text", text: tailContent }],
+            content: [{ type: "text", text: content }],
           };
         }
         
         if (parsed.data.head) {
-          // Use memory-efficient head implementation for large files
-          const headContent = await headFile(validPath, parsed.data.head);
+          const content = await headFile(validPath, parsed.data.head);
           return {
-            content: [{ type: "text", text: headContent }],
+            content: [{ type: "text", text: content }],
           };
+        }
+        
+        // For full file read, check line count
+        if (stats.size > FILE_SIZE_WARNING_THRESHOLD) {
+          const lineCount = await countFileLines(validPath);
+          if (lineCount > DEFAULT_MAX_LINES) {
+            const content = await headFile(validPath, DEFAULT_MAX_LINES);
+            return {
+              content: [{ 
+                type: "text", 
+                text: content + `\n\n... truncated after ${DEFAULT_MAX_LINES} lines (file has ${lineCount} total lines) ...`
+              }],
+            };
+          }
         }
         
         const content = await fs.readFile(validPath, "utf-8");
@@ -602,15 +813,41 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (!parsed.success) {
           throw new Error(`Invalid arguments for read_multiple_files: ${parsed.error}`);
         }
+        
+        if (parsed.data.paths.length > MAX_FILES_TO_READ) {
+          throw new Error(
+            `Too many files requested (${parsed.data.paths.length}). Maximum is ${MAX_FILES_TO_READ}.`
+          );
+        }
+        
+        let totalSize = 0;
         const results = await Promise.all(
           parsed.data.paths.map(async (filePath: string) => {
             try {
               const validPath = await validatePath(filePath);
+              const stats = await fs.stat(validPath);
+              
+              if (totalSize + stats.size > MAX_TOTAL_SIZE_MULTIPLE_FILES) {
+                return `\n--- ${filePath} ---\n[Skipped: Total size limit exceeded]`;
+              }
+              
+              if (stats.size > FILE_SIZE_LIMIT) {
+                return `\n--- ${filePath} ---\n[Skipped: File too large (${formatSize(stats.size)})]`;
+              }
+              
+              totalSize += stats.size;
               const content = await fs.readFile(validPath, "utf-8");
-              return `${filePath}:\n${content}\n`;
+              
+              // Apply line limit per file
+              const lines = content.split('\n');
+              if (lines.length > DEFAULT_MAX_LINES) {
+                return `\n--- ${filePath} ---\n${lines.slice(0, DEFAULT_MAX_LINES).join('\n')}\n... truncated after ${DEFAULT_MAX_LINES} lines ...`;
+              }
+              
+              return `\n--- ${filePath} ---\n${content}`;
             } catch (error) {
               const errorMessage = error instanceof Error ? error.message : String(error);
-              return `${filePath}: Error - ${errorMessage}`;
+              return `\n--- ${filePath} ---\n[Error: ${errorMessage}]`;
             }
           }),
         );
@@ -662,9 +899,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
         const validPath = await validatePath(parsed.data.path);
         const entries = await fs.readdir(validPath, { withFileTypes: true });
-        const formatted = entries
-          .map((entry) => `${entry.isDirectory() ? "[DIR]" : "[FILE]"} ${entry.name}`)
-          .join("\n");
+        
+        let formatted: string;
+        if (entries.length > MAX_DIR_ENTRIES) {
+          const truncated = entries.slice(0, MAX_DIR_ENTRIES);
+          formatted = truncated
+            .map((entry) => `${entry.isDirectory() ? "[DIR]" : "[FILE]"} ${entry.name}`)
+            .join("\n");
+          formatted += TRUNCATION_MESSAGE(MAX_DIR_ENTRIES, entries.length);
+        } else {
+          formatted = entries
+            .map((entry) => `${entry.isDirectory() ? "[DIR]" : "[FILE]"} ${entry.name}`)
+            .join("\n");
+          
+          if (entries.length > MAX_DIR_ENTRIES_WARNING) {
+            formatted += `\n\nNote: Directory contains ${entries.length} entries.`;
+          }
+        }
+        
         return {
           content: [{ type: "text", text: formatted }],
         };
@@ -678,61 +930,48 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const validPath = await validatePath(parsed.data.path);
         const entries = await fs.readdir(validPath, { withFileTypes: true });
         
-        // Get detailed information for each entry
-        const detailedEntries = await Promise.all(
-          entries.map(async (entry) => {
-            const entryPath = path.join(validPath, entry.name);
-            try {
-              const stats = await fs.stat(entryPath);
-              return {
-                name: entry.name,
-                isDirectory: entry.isDirectory(),
-                size: stats.size,
-                mtime: stats.mtime
-              };
-            } catch (error) {
-              return {
-                name: entry.name,
-                isDirectory: entry.isDirectory(),
-                size: 0,
-                mtime: new Date(0)
-              };
+        // Limit entries to process
+        const entriesToProcess = entries.length > MAX_DIR_ENTRIES 
+          ? entries.slice(0, MAX_DIR_ENTRIES)
+          : entries;
+        
+        const entriesWithSizes = await Promise.all(
+          entriesToProcess.map(async (entry) => {
+            const fullPath = path.join(validPath, entry.name);
+            if (entry.isDirectory()) {
+              return { name: entry.name, size: 0, isDirectory: true };
+            } else {
+              try {
+                const stats = await fs.stat(fullPath);
+                return { name: entry.name, size: stats.size, isDirectory: false };
+              } catch {
+                return { name: entry.name, size: 0, isDirectory: false };
+              }
             }
           })
         );
         
         // Sort entries based on sortBy parameter
-        const sortedEntries = [...detailedEntries].sort((a, b) => {
-          if (parsed.data.sortBy === 'size') {
-            return b.size - a.size; // Descending by size
-          }
-          // Default sort by name
-          return a.name.localeCompare(b.name);
-        });
+        if (parsed.data.sortBy === 'size') {
+          entriesWithSizes.sort((a, b) => b.size - a.size);
+        } else {
+          entriesWithSizes.sort((a, b) => a.name.localeCompare(b.name));
+        }
         
-        // Format the output
-        const formattedEntries = sortedEntries.map(entry => 
-          `${entry.isDirectory ? "[DIR]" : "[FILE]"} ${entry.name.padEnd(30)} ${
-            entry.isDirectory ? "" : formatSize(entry.size).padStart(10)
-          }`
-        );
+        let formatted = entriesWithSizes
+          .map((entry) => {
+            const prefix = entry.isDirectory ? "[DIR] " : "[FILE]";
+            const sizeStr = entry.isDirectory ? "" : ` (${formatSize(entry.size)})`;
+            return `${prefix} ${entry.name}${sizeStr}`;
+          })
+          .join("\n");
         
-        // Add summary
-        const totalFiles = detailedEntries.filter(e => !e.isDirectory).length;
-        const totalDirs = detailedEntries.filter(e => e.isDirectory).length;
-        const totalSize = detailedEntries.reduce((sum, entry) => sum + (entry.isDirectory ? 0 : entry.size), 0);
-        
-        const summary = [
-          "",
-          `Total: ${totalFiles} files, ${totalDirs} directories`,
-          `Combined size: ${formatSize(totalSize)}`
-        ];
+        if (entries.length > MAX_DIR_ENTRIES) {
+          formatted += TRUNCATION_MESSAGE(MAX_DIR_ENTRIES, entries.length);
+        }
         
         return {
-          content: [{ 
-            type: "text", 
-            text: [...formattedEntries, ...summary].join("\n") 
-          }],
+          content: [{ type: "text", text: formatted }],
         };
       }
 
@@ -741,43 +980,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (!parsed.success) {
           throw new Error(`Invalid arguments for directory_tree: ${parsed.error}`);
         }
-
-            interface TreeEntry {
-                name: string;
-                type: 'file' | 'directory';
-                children?: TreeEntry[];
-            }
-
-            async function buildTree(currentPath: string): Promise<TreeEntry[]> {
-                const validPath = await validatePath(currentPath);
-                const entries = await fs.readdir(validPath, {withFileTypes: true});
-                const result: TreeEntry[] = [];
-
-                for (const entry of entries) {
-                    const entryData: TreeEntry = {
-                        name: entry.name,
-                        type: entry.isDirectory() ? 'directory' : 'file'
-                    };
-
-                    if (entry.isDirectory()) {
-                        const subPath = path.join(currentPath, entry.name);
-                        entryData.children = await buildTree(subPath);
-                    }
-
-                    result.push(entryData);
-                }
-
-                return result;
-            }
-
-            const treeData = await buildTree(parsed.data.path);
-            return {
-                content: [{
-                    type: "text",
-                    text: JSON.stringify(treeData, null, 2)
-                }],
-            };
+        const validPath = await validatePath(parsed.data.path);
+        
+        const entriesCount = { count: 0 };
+        const tree = await getDirectoryTree(validPath, 0, entriesCount);
+        
+        let result = JSON.stringify(tree, null, 2);
+        if (entriesCount.count >= MAX_TREE_ENTRIES) {
+          result += `\n\nNote: Output truncated at ${MAX_TREE_ENTRIES} entries.`;
         }
+        
+        return {
+          content: [{ type: "text", text: result }],
+        };
+      }
 
       case "move_file": {
         const parsed = MoveFileArgsSchema.safeParse(args);
@@ -798,9 +1014,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           throw new Error(`Invalid arguments for search_files: ${parsed.error}`);
         }
         const validPath = await validatePath(parsed.data.path);
-        const results = await searchFiles(validPath, parsed.data.pattern, parsed.data.excludePatterns);
+        const results = await searchFiles(
+          validPath,
+          parsed.data.pattern,
+          parsed.data.excludePatterns
+        );
+        
+        let output = results.join("\n");
+        if (results.length === 0) {
+          output = "No matching files found.";
+        } else if (results.length >= MAX_SEARCH_RESULTS) {
+          output += `\n\nNote: Results limited to ${MAX_SEARCH_RESULTS} matches.`;
+        }
+        
         return {
-          content: [{ type: "text", text: results.length > 0 ? results.join("\n") : "No matches found" }],
+          content: [{ type: "text", text: output }],
         };
       }
 
