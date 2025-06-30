@@ -19,7 +19,8 @@ package-lock.json
 # Build artifacts
 _book
 .changelog
-dist
+# Commented out to allow npx usage
+# dist
 lib
 coverage
 

@@ -1,11 +1,9 @@
 {
-  "name": "@modelcontextprotocol/server-filesystem",
+  "name": "codemaestroai-filesystem-mcp",
   "version": "0.6.2",
-  "description": "MCP server for filesystem access",
+  "description": "MCP server for filesystem access, Fork of @modelcontextprotocol/server-filesystem",
   "license": "MIT",
-  "author": "Anthropic, PBC (https://anthropic.com)",
-  "homepage": "https://modelcontextprotocol.io",
-  "bugs": "https://github.com/modelcontextprotocol/servers/issues",
+  "author": "Code Maestro",
   "type": "module",
   "bin": {
     "mcp-server-filesystem": "dist/index.js"
