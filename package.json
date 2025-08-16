@@ -21,6 +21,7 @@
     "diff": "^5.1.0",
     "glob": "^10.3.10",
     "minimatch": "^10.0.1",
+    "playwright": "^1.48.0",
     "zod-to-json-schema": "^3.23.5"
   },
   "devDependencies": {

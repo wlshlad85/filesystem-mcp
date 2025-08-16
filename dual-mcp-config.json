@@ -1,0 +1,29 @@
+{
+  "mcpServers": {
+    "filesystem-mcp": {
+      "transport": "stdio",
+      "enabled": true,
+      "command": "node",
+      "args": [
+        "/mnt/c/Users/RICHARD/OneDrive/Documents/GitHub/filesystem-mcp/dist/index.js",
+        "/mnt/c/Users/RICHARD/OneDrive/Documents/GitHub"
+      ],
+      "env": {},
+      "metadata": {
+        "description": "Filesystem operations with basic Playwright support"
+      }
+    },
+    "playwright-mcp": {
+      "transport": "stdio",
+      "enabled": true,
+      "command": "node",
+      "args": [
+        "/mnt/c/Users/RICHARD/OneDrive/Documents/GitHub/playwright-mcp/dist/index.js"
+      ],
+      "env": {},
+      "metadata": {
+        "description": "Advanced browser automation with Microsoft Playwright"
+      }
+    }
+  }
+}

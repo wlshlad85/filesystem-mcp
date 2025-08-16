@@ -14,6 +14,7 @@ import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { diffLines, createTwoFilesPatch } from 'diff';
 import { minimatch } from 'minimatch';
+import { chromium, Browser, Page, BrowserContext } from 'playwright';
 
 // Command line argument parsing
 const args = process.argv.slice(2);
@@ -153,6 +154,51 @@ const GetFileInfoArgsSchema = z.object({
   path: z.string(),
 });
 
+// Playwright schemas
+const PlaywrightLaunchArgsSchema = z.object({
+  headless: z.boolean().optional().default(true).describe('Run browser in headless mode'),
+  timeout: z.number().optional().default(30000).describe('Maximum time in milliseconds to wait for the browser instance to start'),
+});
+
+const PlaywrightNavigateArgsSchema = z.object({
+  url: z.string().url().describe('The URL to navigate to'),
+  waitUntil: z.enum(['load', 'domcontentloaded', 'networkidle']).optional().default('load').describe('When to consider navigation succeeded'),
+  timeout: z.number().optional().default(30000).describe('Maximum navigation time in milliseconds'),
+});
+
+const PlaywrightScreenshotArgsSchema = z.object({
+  path: z.string().optional().describe('The file path to save the screenshot. If not provided, returns base64'),
+  fullPage: z.boolean().optional().default(false).describe('When true, takes a screenshot of the full scrollable page'),
+  type: z.enum(['png', 'jpeg']).optional().default('png').describe('Screenshot image format'),
+});
+
+const PlaywrightClickArgsSchema = z.object({
+  selector: z.string().describe('CSS selector of the element to click'),
+  timeout: z.number().optional().default(5000).describe('Maximum time to wait for the element'),
+  clickCount: z.number().optional().default(1).describe('Number of clicks'),
+});
+
+const PlaywrightFillArgsSchema = z.object({
+  selector: z.string().describe('CSS selector of the input element'),
+  value: z.string().describe('Value to fill'),
+  timeout: z.number().optional().default(5000).describe('Maximum time to wait for the element'),
+});
+
+const PlaywrightEvaluateArgsSchema = z.object({
+  script: z.string().describe('JavaScript code to execute in the page context'),
+});
+
+const PlaywrightWaitForSelectorArgsSchema = z.object({
+  selector: z.string().describe('CSS selector to wait for'),
+  state: z.enum(['attached', 'detached', 'visible', 'hidden']).optional().default('visible').describe('State to wait for'),
+  timeout: z.number().optional().default(5000).describe('Maximum time to wait in milliseconds'),
+});
+
+const PlaywrightGetTextArgsSchema = z.object({
+  selector: z.string().describe('CSS selector of the element to get text from'),
+  timeout: z.number().optional().default(5000).describe('Maximum time to wait for the element'),
+});
+
 const ToolInputSchema = ToolSchema.shape.inputSchema;
 type ToolInput = z.infer<typeof ToolInputSchema>;
 
@@ -178,6 +224,11 @@ const server = new Server(
     },
   },
 );
+
+// Playwright browser state
+let browser: Browser | null = null;
+let context: BrowserContext | null = null;
+let page: Page | null = null;
 
 // Tool implementations
 async function getFileStats(filePath: string): Promise<FileInfo> {
@@ -744,6 +795,83 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: [],
         },
       },
+      // Playwright tools
+      {
+        name: "playwright_launch",
+        description:
+          "Launch a new browser instance using Playwright. This creates a browser context and page " +
+          "that can be used for web automation. The browser runs in headless mode by default. " +
+          "Only one browser instance can be active at a time.",
+        inputSchema: zodToJsonSchema(PlaywrightLaunchArgsSchema) as ToolInput,
+      },
+      {
+        name: "playwright_close",
+        description:
+          "Close the current browser instance and clean up all resources. " +
+          "This should be called when you're done with browser automation.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+          required: [],
+        },
+      },
+      {
+        name: "playwright_navigate",
+        description:
+          "Navigate the browser to a specified URL. Waits for the page to load according to the " +
+          "specified criteria (load, domcontentloaded, or networkidle). " +
+          "Requires an active browser instance from playwright_launch.",
+        inputSchema: zodToJsonSchema(PlaywrightNavigateArgsSchema) as ToolInput,
+      },
+      {
+        name: "playwright_screenshot",
+        description:
+          "Take a screenshot of the current page. Can capture the visible viewport or the full page. " +
+          "If a path is provided within allowed directories, saves the screenshot to disk. " +
+          "Otherwise returns the screenshot as base64-encoded data. " +
+          "Requires an active browser instance.",
+        inputSchema: zodToJsonSchema(PlaywrightScreenshotArgsSchema) as ToolInput,
+      },
+      {
+        name: "playwright_click",
+        description:
+          "Click on an element matching the provided CSS selector. " +
+          "Waits for the element to be visible and clickable before performing the action. " +
+          "Requires an active browser instance.",
+        inputSchema: zodToJsonSchema(PlaywrightClickArgsSchema) as ToolInput,
+      },
+      {
+        name: "playwright_fill",
+        description:
+          "Fill an input field with the specified text. Clears any existing value before filling. " +
+          "The element must be an input, textarea, or contenteditable element. " +
+          "Requires an active browser instance.",
+        inputSchema: zodToJsonSchema(PlaywrightFillArgsSchema) as ToolInput,
+      },
+      {
+        name: "playwright_evaluate",
+        description:
+          "Execute JavaScript code in the context of the current page. " +
+          "Returns the result of the evaluation. Can access page variables and DOM. " +
+          "Requires an active browser instance.",
+        inputSchema: zodToJsonSchema(PlaywrightEvaluateArgsSchema) as ToolInput,
+      },
+      {
+        name: "playwright_wait_for_selector",
+        description:
+          "Wait for an element matching the CSS selector to reach the specified state. " +
+          "States: 'attached' (DOM), 'detached' (removed), 'visible' (visible), 'hidden' (hidden). " +
+          "Requires an active browser instance.",
+        inputSchema: zodToJsonSchema(PlaywrightWaitForSelectorArgsSchema) as ToolInput,
+      },
+      {
+        name: "playwright_get_text",
+        description:
+          "Get the text content of an element matching the provided CSS selector. " +
+          "Waits for the element to be visible before retrieving text. " +
+          "Requires an active browser instance.",
+        inputSchema: zodToJsonSchema(PlaywrightGetTextArgsSchema) as ToolInput,
+      },
     ],
   };
 });
@@ -1055,6 +1183,230 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+      // Playwright tool handlers
+      case "playwright_launch": {
+        const parsed = PlaywrightLaunchArgsSchema.safeParse(args);
+        if (!parsed.success) {
+          throw new Error(`Invalid arguments for playwright_launch: ${parsed.error}`);
+        }
+        
+        // Close existing browser if any
+        if (browser) {
+          await browser.close();
+        }
+        
+        browser = await chromium.launch({
+          headless: parsed.data.headless,
+          timeout: parsed.data.timeout,
+        });
+        context = await browser.newContext();
+        page = await context.newPage();
+        
+        return {
+          content: [{
+            type: "text",
+            text: "Browser launched successfully"
+          }],
+        };
+      }
+
+      case "playwright_close": {
+        if (browser) {
+          await browser.close();
+          browser = null;
+          context = null;
+          page = null;
+          return {
+            content: [{
+              type: "text",
+              text: "Browser closed successfully"
+            }],
+          };
+        }
+        return {
+          content: [{
+            type: "text",
+            text: "No browser instance to close"
+          }],
+        };
+      }
+
+      case "playwright_navigate": {
+        if (!page) {
+          throw new Error("No browser instance. Call playwright_launch first.");
+        }
+        
+        const parsed = PlaywrightNavigateArgsSchema.safeParse(args);
+        if (!parsed.success) {
+          throw new Error(`Invalid arguments for playwright_navigate: ${parsed.error}`);
+        }
+        
+        await page.goto(parsed.data.url, {
+          waitUntil: parsed.data.waitUntil as any,
+          timeout: parsed.data.timeout,
+        });
+        
+        return {
+          content: [{
+            type: "text",
+            text: `Navigated to ${parsed.data.url}`
+          }],
+        };
+      }
+
+      case "playwright_screenshot": {
+        if (!page) {
+          throw new Error("No browser instance. Call playwright_launch first.");
+        }
+        
+        const parsed = PlaywrightScreenshotArgsSchema.safeParse(args);
+        if (!parsed.success) {
+          throw new Error(`Invalid arguments for playwright_screenshot: ${parsed.error}`);
+        }
+        
+        const screenshotOptions: any = {
+          fullPage: parsed.data.fullPage,
+          type: parsed.data.type,
+        };
+        
+        if (parsed.data.path) {
+          // Validate path is within allowed directories
+          const validPath = await validatePath(parsed.data.path);
+          screenshotOptions.path = validPath;
+          await page.screenshot(screenshotOptions);
+          return {
+            content: [{
+              type: "text",
+              text: `Screenshot saved to ${validPath}`
+            }],
+          };
+        } else {
+          const buffer = await page.screenshot(screenshotOptions);
+          return {
+            content: [{
+              type: "text",
+              text: buffer.toString('base64')
+            }],
+          };
+        }
+      }
+
+      case "playwright_click": {
+        if (!page) {
+          throw new Error("No browser instance. Call playwright_launch first.");
+        }
+        
+        const parsed = PlaywrightClickArgsSchema.safeParse(args);
+        if (!parsed.success) {
+          throw new Error(`Invalid arguments for playwright_click: ${parsed.error}`);
+        }
+        
+        await page.click(parsed.data.selector, {
+          timeout: parsed.data.timeout,
+          clickCount: parsed.data.clickCount,
+        });
+        
+        return {
+          content: [{
+            type: "text",
+            text: `Clicked element: ${parsed.data.selector}`
+          }],
+        };
+      }
+
+      case "playwright_fill": {
+        if (!page) {
+          throw new Error("No browser instance. Call playwright_launch first.");
+        }
+        
+        const parsed = PlaywrightFillArgsSchema.safeParse(args);
+        if (!parsed.success) {
+          throw new Error(`Invalid arguments for playwright_fill: ${parsed.error}`);
+        }
+        
+        await page.fill(parsed.data.selector, parsed.data.value, {
+          timeout: parsed.data.timeout,
+        });
+        
+        return {
+          content: [{
+            type: "text",
+            text: `Filled element ${parsed.data.selector} with value`
+          }],
+        };
+      }
+
+      case "playwright_evaluate": {
+        if (!page) {
+          throw new Error("No browser instance. Call playwright_launch first.");
+        }
+        
+        const parsed = PlaywrightEvaluateArgsSchema.safeParse(args);
+        if (!parsed.success) {
+          throw new Error(`Invalid arguments for playwright_evaluate: ${parsed.error}`);
+        }
+        
+        const result = await page.evaluate(parsed.data.script);
+        
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify(result, null, 2)
+          }],
+        };
+      }
+
+      case "playwright_wait_for_selector": {
+        if (!page) {
+          throw new Error("No browser instance. Call playwright_launch first.");
+        }
+        
+        const parsed = PlaywrightWaitForSelectorArgsSchema.safeParse(args);
+        if (!parsed.success) {
+          throw new Error(`Invalid arguments for playwright_wait_for_selector: ${parsed.error}`);
+        }
+        
+        await page.waitForSelector(parsed.data.selector, {
+          state: parsed.data.state as any,
+          timeout: parsed.data.timeout,
+        });
+        
+        return {
+          content: [{
+            type: "text",
+            text: `Element ${parsed.data.selector} is now ${parsed.data.state}`
+          }],
+        };
+      }
+
+      case "playwright_get_text": {
+        if (!page) {
+          throw new Error("No browser instance. Call playwright_launch first.");
+        }
+        
+        const parsed = PlaywrightGetTextArgsSchema.safeParse(args);
+        if (!parsed.success) {
+          throw new Error(`Invalid arguments for playwright_get_text: ${parsed.error}`);
+        }
+        
+        const element = await page.waitForSelector(parsed.data.selector, {
+          timeout: parsed.data.timeout,
+        });
+        
+        if (!element) {
+          throw new Error(`Element not found: ${parsed.data.selector}`);
+        }
+        
+        const text = await element.textContent();
+        
+        return {
+          content: [{
+            type: "text",
+            text: text || ""
+          }],
+        };
+      }
+
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
@@ -1068,6 +1420,38 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 });
 
 // Start server
+// Cleanup function for browser
+async function cleanupBrowser() {
+  if (browser) {
+    try {
+      await browser.close();
+      browser = null;
+      context = null;
+      page = null;
+    } catch (error) {
+      console.error("Error closing browser:", error);
+    }
+  }
+}
+
+// Handle process termination
+process.on('SIGINT', async () => {
+  await cleanupBrowser();
+  process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+  await cleanupBrowser();
+  process.exit(0);
+});
+
+process.on('exit', () => {
+  if (browser) {
+    // Synchronous cleanup attempt on exit
+    browser.close().catch(() => {});
+  }
+});
+
 async function runServer() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
